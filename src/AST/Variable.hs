@@ -286,4 +286,5 @@ instance (Binary a) => Binary (Listing a) where
     put (Listing explicits open) =
         put explicits >> put open
 
-    get = Listing <$> get <*> get
+    get =
+        Listing <$> get <*> get
