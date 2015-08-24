@@ -1,66 +1,27 @@
-module Generate.JavaScript (generate) where
+module Generate.JavaScript.Expression where
 
 import Control.Applicative ((<$>),(<*>))
-import Control.Arrow (first, second, (***))
+import Control.Arrow (second)
 import Control.Monad.State
 import qualified Data.List as List
 import qualified Data.Map as Map
 import qualified Data.Maybe as Maybe
-import qualified Data.Set as Set
-import Language.ECMAScript3.PrettyPrint
 import Language.ECMAScript3.Syntax
 
-import AST.Module
 import AST.Expression.General as Expr
 import qualified AST.Expression.Optimized as Opt
 import qualified AST.Helpers as Help
-import AST.Literal
-import qualified AST.Module as Module
+import qualified AST.Literal as L
 import qualified AST.Pattern as P
 import qualified AST.Variable as Var
-import Elm.Utils ((|>))
 import Generate.JavaScript.Helpers as Help
+import qualified Generate.JavaScript.BuiltIn as BuiltIn
 import qualified Generate.JavaScript.Crash as Crash
-import qualified Generate.JavaScript.Port as Port
+import qualified Generate.JavaScript.Literal as Literal
 import qualified Generate.JavaScript.Variable as Var
 import qualified Optimize.Cases as Case
 import qualified Reporting.Annotation as A
 import qualified Reporting.Crash as Crash
-
-
--- HELPERS
-
-internalImports :: Module.Name -> [VarDecl ()]
-internalImports name =
-    [ varDecl "_N" (obj ["Elm","Native"])
-    , include "_U" "Utils"
-    , include "_L" "List"
-    , varDecl Crash.localModuleName (string (Module.nameToString name))
-    ]
-  where
-    include :: String -> String -> VarDecl ()
-    include alias modul =
-        varDecl alias (Help.make ["_N", modul])
-
-
-_Utils :: String -> Expression ()
-_Utils x =
-    obj ["_U", x]
-
-
-_List :: String -> Expression ()
-_List x =
-    obj ["_L", x]
-
-
-literal :: Literal -> Expression ()
-literal lit =
-  case lit of
-    Chr c -> _Utils "chr" <| string [c]
-    Str s -> string s
-    IntNum   n -> IntLit () n
-    FloatNum n -> NumLit () n
-    Boolean  b -> BoolLit () b
 
 
 -- CODE CHUNKS
@@ -145,99 +106,91 @@ exprToJsExpr tcc canonicalExpr =
 
 exprToCode :: TailCallContext -> Opt.Expr -> State Int Code
 exprToCode tcc annotatedExpr@(A.A _ expr) =
-    case expr of
-      Var var ->
-          jsExpr $ Var.canonical var
+  case expr of
+    Var var ->
+        jsExpr (Var.canonical var)
 
-      Literal lit ->
-          jsExpr $ literal lit
+    Literal lit ->
+        jsExpr (Literal.literal lit)
 
-      Range lo hi ->
-          do  lo' <- toJsExpr lo
-              hi' <- toJsExpr hi
-              jsExpr $ _List "range" `call` [lo',hi']
+    Range low high ->
+        do  jsLow <- toJsExpr low
+            jsHigh <- toJsExpr high
+            jsExpr $ BuiltIn.range jsLow jsHigh
 
-      Access record field ->
-          do  record' <- toJsExpr record
-              jsExpr $ DotRef () record' (var (Var.varName field))
+    Access record field ->
+        do  record' <- toJsExpr record
+            jsExpr $ DotRef () record' (var (Var.safe field))
 
-      Update e fields ->
-          do  record' <- toJsExpr record
-              fields' <-
-                forM fields $ \(field, value) ->
-                  do  value' <- toJsExpr value
-                      return $ ArrayLit () [ string (Var.varName field), value' ]
+    Update record fields ->
+        let
+          fieldToJs (field, value) =
+            do  jsValue <- toJsExpr value
+                return (Var.safe field, jsValue)
+        in
+          do  jsRecord <- toJsExpr record
+              jsFields <- mapM fieldToJs fields
+              jsExpr $ BuiltIn.recordUpdate jsRecord jsFields
 
-              jsExpr $ _Utils "replace" `call` [ArrayLit () fields', record']
+    Record fields ->
+        let
+          fieldToJs (field, value) =
+            (,) (prop (Var.safe field)) <$> toJsExpr value
+        in
+          do  jsFields <- mapM fieldToJs fields
+              jsExpr $ ObjectLit () jsFields
 
-      Record fields ->
-          do  fields' <-
-                forM fields $ \(field, e) ->
-                    (,) (Var.varName field) <$> toJsExpr e
+    Binop op leftExpr rightExpr ->
+        binop op leftExpr rightExpr
 
-              let fieldMap =
-                    List.foldl' combine Map.empty fields'
+    Lambda _ _ ->
+        generateFunction (Expr.collectLambdas annotatedExpr)
 
-              jsExpr $ ObjectLit () $ (prop "_", hidden fieldMap) : visible fieldMap
-          where
-            combine record (field, value) =
-                Map.insertWith (++) field [value] record
+    App _ _ ->
+        generateApplication tcc annotatedExpr
 
-            hidden fs =
-                ObjectLit () . map (prop *** ArrayLit ()) $
-                  Map.toList (Map.filter (not . null) (Map.map tail fs))
+    Let defs body ->
+        generateLet tcc defs body
 
-            visible fs =
-                map (first prop) (Map.toList (Map.map head fs))
+    MultiIf branches finally ->
+        generateIf tcc branches finally
 
-      Binop op leftExpr rightExpr ->
-          binop op leftExpr rightExpr
+    Case expr branches ->
+        generateCase tcc expr branches
 
-      Lambda _ _ ->
-          generateFunction (Expr.collectLambdas annotatedExpr)
+    ExplicitList elements ->
+        do  jsElements <- mapM toJsExpr elements
+            jsExpr $ BuiltIn.list jsElements
 
-      App _ _ ->
-          generateApplication tcc annotatedExpr
+    Data tag members ->
+        do  jsMembers <- mapM toJsExpr members
+            jsExpr $ ObjectLit () (ctor : fields jsMembers)
+        where
+          ctor = (prop "ctor", StringLit () tag)
+          fields =
+              zipWith (\n e -> (prop ("_" ++ show n), e)) [ 0 :: Int .. ]
 
-      Let defs body ->
-          generateLet tcc defs body
+    GLShader _uid src _tipe ->
+        jsExpr $ ObjectLit () [(PropString () "src", Literal.literal (L.Str src))]
 
-      MultiIf branches finally ->
-          generateIf tcc branches finally
+    Port impl ->
+        error "TODO" impl
+{--
+        case impl of
+          In name portType ->
+              jsExpr (Port.inbound name portType)
 
-      Case expr branches ->
-          generateCase tcc expr branches
+          Out name expr portType ->
+              do  expr' <- toJsExpr expr
+                  jsExpr (Port.outbound name expr' portType)
 
-      ExplicitList elements ->
-          do  jsElements <- mapM toJsExpr elements
-              jsExpr $ _List "fromArray" <| ArrayLit () jsElements
+          Task name expr portType ->
+              do  expr' <- toJsExpr expr
+                  jsExpr (Port.task name expr' portType)
+--}
 
-      Data tag members ->
-          do  jsMembers <- mapM toJsExpr members
-              jsExpr $ ObjectLit () (ctor : fields jsMembers)
-          where
-            ctor = (prop "ctor", string tag)
-            fields =
-                zipWith (\n e -> (prop ("_" ++ show n), e)) [ 0 :: Int .. ]
-
-      GLShader _uid src _tipe ->
-          jsExpr $ ObjectLit () [(PropString () "src", literal (Str src))]
-
-      Port impl ->
-          case impl of
-            In name portType ->
-                jsExpr (Port.inbound name portType)
-
-            Out name expr portType ->
-                do  expr' <- toJsExpr expr
-                    jsExpr (Port.outbound name expr' portType)
-
-            Task name expr portType ->
-                do  expr' <- toJsExpr expr
-                    jsExpr (Port.task name expr' portType)
-
-      Crash details ->
-          jsExpr $ Crash.crash details
+    Crash details ->
+        jsExpr $ Crash.crash details
 
 
 -- FUNCTIONS
@@ -287,7 +240,7 @@ destructPattern :: P.Optimized -> State Int (String, Maybe Opt.Def)
 destructPattern pattern@(A.A ann pat) =
   case pat of
     P.Var x ->
-        return (Var.varName x, Nothing)
+        return (Var.safe x, Nothing)
 
     _ ->
         do  arg <- Case.newVar
@@ -360,6 +313,16 @@ generateLet tcc givenDefs givenBody =
       jsBlock (stmts ++ toStatementList code)
 
 
+flattenLets :: [Opt.Def] -> Opt.Expr -> ([Opt.Def], Opt.Expr)
+flattenLets defs lexpr@(A.A _ expr) =
+  case expr of
+    Let ds body ->
+        flattenLets (defs ++ ds) body
+
+    _ ->
+        (defs, lexpr)
+
+
 -- GENERATE IFS
 
 generateIf :: TailCallContext -> [(Opt.Expr, Opt.Expr)] -> Opt.Expr -> State Int Code
@@ -410,7 +373,7 @@ crushIfsHelp visitedBranches unvisitedBranches finally =
           _ ->
               (reverse visitedBranches, finally)
 
-    (A.A _ (Literal (Boolean True)), branch) : _ ->
+    (A.A _ (Literal (L.Boolean True)), branch) : _ ->
         crushIfsHelp visitedBranches [] branch
 
     (A.A _ (Var (Var.Canonical (Var.Module ["Basics"]) "otherwise")), branch) : _ ->
@@ -448,11 +411,11 @@ defToStatementsHelp facts annPattern@(A.A _ pattern) jsExpr =
     P.Var x ->
         if Help.isOp x then
             let
-                op = LBracket () (ref "_op") (string x)
+                op = LBracket () (ref "_op") (StringLit () x)
             in
                 return [ ExprStmt () $ AssignExpr () OpAssign op jsExpr ]
         else
-            return [ VarDeclStmt () [ define (Var.varName x) ] ]
+            return [ VarDeclStmt () [ define (Var.safe x) ] ]
 
     P.Record fields ->
         let
@@ -468,7 +431,7 @@ defToStatementsHelp facts annPattern@(A.A _ pattern) jsExpr =
         getVars patterns =
             case patterns of
               A.A _ (P.Var x) : rest ->
-                  (Var.varName x :) `fmap` getVars rest
+                  (Var.safe x :) `fmap` getVars rest
               [] ->
                   Just []
               _ ->
@@ -480,7 +443,7 @@ defToStatementsHelp facts annPattern@(A.A _ pattern) jsExpr =
             | otherwise = define "_raw" : safeAssign : vars
 
         safeAssign = varDecl "$" (CondExpr () if' (ref "_raw") exception)
-        if' = InfixExpr () OpStrictEq (obj ["_raw","ctor"]) (string name)
+        if' = InfixExpr () OpStrictEq (obj ["_raw","ctor"]) (StringLit () name)
         exception = Crash.crash (Crash.IncompletePatternMatch (error "TODO"))
 
     _ ->
@@ -506,7 +469,7 @@ generateCase tcc expr branches =
       (revisedMatch, stmt) <-
           case expr of
             A.A _ (Var (Var.Canonical Var.Local x)) ->
-                return (Case.matchSubst [(tempVar, Var.varName x)] initialMatch, [])
+                return (Case.matchSubst [(tempVar, Var.safe x)] initialMatch, [])
             _ ->
                 do  expr' <- toJsExpr expr
                     return (initialMatch, [VarDeclStmt () [varDecl tempVar expr']])
@@ -539,7 +502,7 @@ match tcc mtch =
 
           format isChars expr =
               if or isChars then
-                  InfixExpr () OpAdd expr (string "")
+                  InfixExpr () OpAdd expr (StringLit () "")
               else
                   expr
 
@@ -572,107 +535,20 @@ clause tcc variable (Case.Clause value vars mtch) =
 
     (isChar, pattern) =
         case value of
-          Right (Chr c) -> (True, string [c])
+          Right (L.Chr c) ->
+            (True, StringLit () [c])
+
           _ ->
             (,) False $
               case value of
-                Right (Boolean b) -> BoolLit () b
-                Right lit -> literal lit
+                Right (L.Boolean b) ->
+                    BoolLit () b
+
+                Right lit ->
+                    Literal.literal lit
+
                 Left (Var.Canonical _ name) ->
-                    string name
-
-
-flattenLets :: [Opt.Def] -> Opt.Expr -> ([Opt.Def], Opt.Expr)
-flattenLets defs lexpr@(A.A _ expr) =
-    case expr of
-      Let ds body -> flattenLets (defs ++ ds) body
-      _ -> (defs, lexpr)
-
-
-generate :: Module.Optimized -> String
-generate modul =
-    show . prettyPrint $ setup "Elm" (names ++ ["make"]) ++
-             [ assign ("Elm" : names ++ ["make"]) (function [localRuntime] programStmts) ]
-  where
-    names :: [String]
-    names = Module.names modul
-
-    thisModule :: Expression ()
-    thisModule = obj (localRuntime : names ++ ["values"])
-
-    programStmts :: [Statement ()]
-    programStmts =
-        concat
-        [ [ ExprStmt () (string "use strict") ]
-        , setup localRuntime (names ++ ["values"])
-        , [ IfSingleStmt () thisModule (ret thisModule) ]
-        , [ VarDeclStmt () localVars ]
-        , body
-        , [ jsExports ]
-        , [ ret thisModule ]
-        ]
-
-    localVars :: [VarDecl ()]
-    localVars =
-        varDecl "_op" (ObjectLit () [])
-        : internalImports (Module.names modul)
-        ++ explicitImports
-      where
-        explicitImports :: [VarDecl ()]
-        explicitImports =
-            Module.imports modul
-              |> Set.fromList
-              |> Set.toList
-              |> map jsImport
-
-        jsImport :: Module.Name -> VarDecl ()
-        jsImport name =
-            varDecl (Var.moduleName name) $
-                obj ("Elm" : name ++ ["make"]) <| ref localRuntime
-
-    body :: [Statement ()]
-    body =
-        concat (evalState defs 0)
-      where
-        defs =
-            Module.program (Module.body modul)
-              |> flattenLets []
-              |> fst
-              |> mapM defToStatements
-
-    setup namespace path =
-        map create paths
-      where
-        create name =
-            assign name (InfixExpr () OpLOr (obj name) (ObjectLit () []))
-        paths =
-            namespace : path
-              |> List.inits
-              |> init
-              |> drop 2
-
-    jsExports =
-        assign (localRuntime : names ++ ["values"]) (ObjectLit () exs)
-      where
-        exs = map entry $ "_op" : concatMap extract (exports modul)
-        entry x = (prop x, ref x)
-        extract value =
-            case value of
-              Var.Alias _ -> []
-
-              Var.Value x
-                | Help.isOp x -> []
-                | otherwise   -> [Var.varName x]
-
-              Var.Union _ (Var.Listing ctors _) ->
-                  map Var.varName ctors
-
-    assign path expr =
-      case path of
-        [x] -> VarDeclStmt () [ varDecl x expr ]
-        _ ->
-          ExprStmt () $
-          AssignExpr () OpAssign (LDot () (obj (init path)) (last path)) expr
+                    StringLit () name
 
 
 -- BINARY OPERATORS
@@ -786,8 +662,8 @@ specialOps :: [(String, Expression () -> Expression () -> Expression ())]
 specialOps =
     [ (,) "^"  $ \a b -> obj ["Math","pow"] `call` [a,b]
     , (,) "|>" $ flip (<|)
-    , (,) "==" $ \a b -> _Utils "eq" `call` [a,b]
-    , (,) "/=" $ \a b -> PrefixExpr () PrefixLNot (_Utils "eq" `call` [a,b])
+    , (,) "==" $ \a b -> BuiltIn.eq a b
+    , (,) "/=" $ \a b -> PrefixExpr () PrefixLNot (BuiltIn.eq a b)
     , (,) "<"  $ cmp OpLT 0
     , (,) ">"  $ cmp OpGT 0
     , (,) "<=" $ cmp OpLT 1
@@ -798,7 +674,7 @@ specialOps =
 
 cmp :: InfixOp -> Int -> Expression () -> Expression () -> Expression ()
 cmp op n a b =
-    InfixExpr () op (_Utils "cmp" `call` [a,b]) (IntLit () n)
+    InfixExpr () op (BuiltIn.compare a b) (IntLit () n)
 
 
 -- BINARY OPERATOR COLLECTORS

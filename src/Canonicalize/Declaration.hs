@@ -19,10 +19,12 @@ toExpr moduleName decls =
 
 toDefs :: Module.Name -> D.CanonicalDecl -> [Canonical.Def]
 toDefs moduleName (A.A (region,_) decl) =
-  let typeVar = Var.fromModule moduleName
+  let
+    canonicalVar =
+      Var.fromModule moduleName
 
-      loc expr =
-        A.A region expr
+    loc expr =
+      A.A region expr
   in
   case decl of
     D.Definition def ->
@@ -33,7 +35,7 @@ toDefs moduleName (A.A (region,_) decl) =
       where
         toDefs' (ctor, tipes) =
             let vars = take (length tipes) infiniteArgs
-                tbody = T.App (T.Type (typeVar name)) (map T.Var tvars)
+                tbody = T.App (T.Type (canonicalVar name)) (map T.Var tvars)
                 body = loc . E.Data ctor $ map (loc . E.localVar) vars
             in
                 [ definition ctor (buildFunction body vars) region (foldr T.Lambda tbody tipes) ]
@@ -42,7 +44,7 @@ toDefs moduleName (A.A (region,_) decl) =
         [ definition name (buildFunction record vars) region (foldr T.Lambda result args) ]
       where
         result =
-          T.Aliased (typeVar name) (zip tvars (map T.Var tvars)) (T.Holey tipe)
+          T.Aliased (canonicalVar name) (zip tvars (map T.Var tvars)) (T.Holey tipe)
 
         args =
           map snd fields

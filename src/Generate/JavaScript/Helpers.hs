@@ -3,24 +3,9 @@ module Generate.JavaScript.Helpers where
 import Language.ECMAScript3.Syntax
 
 
-localRuntime :: String
-localRuntime =
-    "_elm"
-
-
 varDecl :: String -> Expression () -> VarDecl ()
 varDecl x expr =
     VarDecl () (var x) (Just expr)
-
-
-make :: [String] -> Expression ()
-make moduleName =
-    obj (moduleName ++ ["make"]) <| ref localRuntime
-
-
-useLazy :: [String] -> String -> Expression ()
-useLazy moduleName functionName =
-    DotRef () (make moduleName) (var functionName)
 
 
 -- Creating Variables
@@ -38,9 +23,6 @@ ref name =
 prop :: String -> Prop ()
 prop name =
     PropId () (var name)
-
-
-string = StringLit ()
 
 
 obj :: [String] -> Expression ()
@@ -91,9 +73,9 @@ instanceof tipe x =
 
 typeof :: String -> Expression () -> Expression ()
 typeof tipe x =
-    equal (PrefixExpr () PrefixTypeof x) (string tipe)
+    equal (PrefixExpr () PrefixTypeof x) (StringLit () tipe)
 
 
 member :: String -> Expression () -> Expression ()
 member field x =
-    InfixExpr () OpIn (string field) x
+    InfixExpr () OpIn (StringLit () field) x
